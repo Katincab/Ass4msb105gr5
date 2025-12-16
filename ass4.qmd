@@ -1,0 +1,749 @@
+---
+title: "Ass4"
+format: html
+editor: visual
+---
+
+---
+title: "Untitled"
+author: "Katinca"
+date: "2025-12-15"
+output: html_document
+---
+
+library(tidyverse) library(readxl) library(restatapi) library(DescTools) library(ggrepel) library(flextable) library(modelr) library(plm) library(broom) library(sandwich)
+
+## Setup
+
+```{r setup}
+library(tidyverse)
+library(readxl)
+library(restatapi)
+library(DescTools)
+library(ggrepel)
+library(flextable)
+library(modelr)
+library(plm)
+library(broom)
+library(sandwich)
+```
+
+## 1. Population data (NUTS 3)
+
+```{r toc}
+toc_txt <- get_eurostat_toc(mode = "txt")
+```
+
+```{r pop_tables}
+pop_tabs <- toc_txt |>
+  filter(
+    str_detect(title, "[Pp]opulation") &
+      str_detect(title, "[Nn][Uu][Tt][Ss]\\s*3")
+  ) |>
+  select(title, code)
+
+pop_tabs |>
+  flextable() |>
+  width(1, 7) |>
+  width(2, 2)
+```
+
+```{r pop_code}
+pop_tab_code <- pop_tabs |>
+  filter(str_detect(title, "Average annual population")) |>
+  pull(code)
+
+pop_tab_code
+```
+
+```{r pop_dsd}
+dsd_pop <- get_eurostat_dsd(pop_tab_code)
+
+dsd_pop |>
+  filter(concept %in% c("freq", "sex", "age", "unit")) |>
+  flextable() |>
+  width(1, 1.2) |>
+  width(2, 2.2) |>
+  width(3, 6)
+```
+
+```{r population_data}
+pop <- get_eurostat_data(
+  id = pop_tab_code,
+  filters = list(
+    nuts_level = "3",
+    sex = "T",
+    age = "TOTAL"
+  ),
+  exact_match = FALSE,
+  date_filter = 2000:2023,
+  stringsAsFactors = FALSE
+) |>
+  mutate(
+    pop_n3 = 1000 * values
+  ) |>
+  select(geo, time, pop_n3) |>
+  filter(str_length(geo) == 5) |>
+  as_tibble()
+```
+
+```{r pop_check}
+dim(pop)
+head(pop)
+```
+
+## 2. GDP data (NUTS 3)
+
+```{r gdp_tables}
+gdp_tabs <- toc_txt |>
+  filter(
+    str_detect(title, "[Gg][Dd][Pp]") &
+      str_detect(title, "[Nn][Uu][Tt][Ss]\\s*3")
+  ) |>
+  select(title, code)
+
+gdp_tabs |>
+  flextable() |>
+  width(1, width = 3.5) |>
+  width(2, width = 1.5)
+```
+
+```{r gdp_dsd}
+dsd_gdp <- get_eurostat_dsd("nama_10r_3gdp")
+
+dsd_gdp |>
+  filter(concept %in% c("freq", "unit")) |>
+  flextable() |>
+  width(1, 1) |>
+  width(2, 2) |>
+  width(3, 4)
+```
+
+```{r gdp_data}
+gdp <- get_eurostat_data(
+  id = "nama_10r_3gdp",
+  filters = list(
+    nuts_level = "3",
+    unit = "MIO_PPS_EU27_2020"
+  ),
+  exact_match = FALSE,
+  date_filter = 2000:2023,
+  stringsAsFactors = FALSE
+) |>
+  mutate(gdp_n3 = 1000000 * values) |>
+  select(geo, time, gdp_n3) |>
+  filter(str_length(geo) == 5) |>
+  as_tibble()
+
+dim(gdp)
+head(gdp)
+```
+
+```{r ie053_fix}
+gdp |>
+  filter(geo == "IE053") |>
+  print(n = 25)
+
+ie_data <- tibble(
+  geo = c("IE053", "IE053", "IE053"),
+  time = c("2015", "2016", "2017"),
+  gdp_n3 = c(NA, NA, NA)
+)
+
+gdp <- bind_rows(gdp, ie_data) |>
+  arrange(geo, time) |>
+  group_by(geo) |>
+  mutate(gdp_n3 = zoo::na.approx(gdp_n3, na.rm = FALSE)) |>
+  ungroup()
+
+gdp |>
+  filter(geo == "IE053") |>
+  print(n = 25)
+```
+
+```{r join_gdp_pop}
+gdp_pop <- gdp |>
+  left_join(pop, by = c("geo", "time"))
+
+dim(gdp_pop)
+```
+
+```{r eu_data_exact}
+eu_data <- gdp_pop |>
+  filter(!str_sub(geo, 3, 4) == "ZZ") |>
+  filter(!str_sub(geo, 1, 2) %in% c("CH", "NO")) |>
+  filter(!str_sub(geo, 1, 2) %in% c("NL", "PT")) |>
+  filter(!str_sub(geo, 1, 2) %in% c("ME")) |>
+  filter(!geo == "FRY50") |>
+  filter(time > 1999 & time < 2023) |>
+  mutate(
+    n3 = geo,
+    n2 = str_sub(geo, 1, 4),
+    n1 = str_sub(geo, 1, 3),
+    nc = str_sub(geo, 1, 2),
+    gdp_pc_n3 = gdp_n3 / pop_n3
+  )
+
+dim(eu_data)
+head(eu_data)
+```
+
+```{r n3}
+n3 <- eu_data |>
+  select(time, n3, gdp_pc_n3)
+```
+
+```{r n2}
+n2 <- eu_data |>
+  group_by(time, n2) |>
+  summarise(
+    gdp_pc_n2 = weighted.mean(gdp_pc_n3, pop_n3, na.rm = TRUE),
+    .groups = "drop"
+  )
+```
+
+```{r gini_n2}
+gini_n2 <- n2 |>
+  group_by(time) |>
+  summarise(
+    gini_n2 = Gini(gdp_pc_n2),
+    .groups = "drop"
+  )
+
+head(gini_n2)
+```
+
+```{r n1}
+n1 <- eu_data |>
+  group_by(time, n1) |>
+  summarise(
+    gdp_pc_n1 = weighted.mean(gdp_pc_n3, pop_n3, na.rm = TRUE),
+    .groups = "drop"
+  )
+```
+
+```{r gini_n1}
+gini_n1 <- n1 |>
+  group_by(time) |>
+  summarise(
+    gini_n1 = Gini(gdp_pc_n1),
+    .groups = "drop"
+  )
+
+head(gini_n1)
+```
+
+```{r nc}
+nc <- eu_data |>
+  group_by(time, nc) |>
+  summarise(
+    gdp_pc_nc = weighted.mean(gdp_pc_n3, pop_n3, na.rm = TRUE),
+    .groups = "drop"
+  )
+```
+
+```{r gini_nc}
+gini_nc <- nc |>
+  group_by(time) |>
+  summarise(
+    gini_nc = Gini(gdp_pc_nc),
+    .groups = "drop"
+  )
+
+head(gini_nc)
+```
+
+```{r gini_n3}
+gini_n3 <- eu_data |>
+  group_by(time) |>
+  summarise(
+    gini_n3 = Gini(gdp_pc_n3, weights = pop_n3),
+    .groups = "drop"
+  )
+
+head(gini_n3)
+```
+
+```{r gini_all}
+gini_all <- gini_n3 |>
+  left_join(gini_n2, by = "time") |>
+  left_join(gini_n1, by = "time") |>
+  left_join(gini_nc, by = "time")
+
+gini_all |>
+  flextable() |>
+  width(1, 1.2) |>
+  width(2:5, 1.4)
+```
+
+```{r gini_all_table}
+gini_all <- gini_n3 |>
+  left_join(gini_n2, by = "time") |>
+  left_join(gini_n1, by = "time") |>
+  left_join(gini_nc, by = "time")
+
+gini_all |>
+  flextable() |>
+  width(1, 1.2) |>
+  width(2:5, 1.4)
+```
+
+```{r gini_plot}
+gini_long <- gini_all |>
+  pivot_longer(
+    cols = -time,
+    names_to = "level",
+    values_to = "gini"
+  ) |>
+  mutate(
+    time = as.integer(time),
+    level = recode(level,
+                   gini_n3 = "NUTS 3",
+                   gini_n2 = "NUTS 2",
+                   gini_n1 = "NUTS 1",
+                   gini_nc = "Country")
+  )
+
+ggplot(gini_long, aes(x = time, y = gini, color = level)) +
+  geom_line(linewidth = 1) +
+  labs(x = NULL, y = "Gini", color = NULL) +
+  theme_minimal()
+```
+
+```{r gini_plot_final, fig.width=7, fig.height=4}
+gini_long |>
+  ggplot(aes(x = time, y = gini, colour = level)) +
+  geom_line(linewidth = 1) +
+  labs(
+    x = NULL,
+    y = "Gini",
+    colour = NULL
+  ) +
+  theme_minimal()
+```
+
+\`\`\`{r gini_n2_new} gini_n2_new \<- eu_data \|\> group_by(n2, time, n1, nc) \|\> summarise( gini_n2 = DescTools::Gini(gdp_pc_n3, weights = pop_n3, na.rm = TRUE), pop_n2 = sum(pop_n3, na.rm = TRUE), gdp_n2 = sum(gdp_n3, na.rm = TRUE), gdp_pc_n2 = gdp_n2 / pop_n2, num_reg_n2 = n(), .groups = "drop" )
+
+head(gini_n2_new)
+
+\`\`\`{r gini_n1_new} gini_n1_new \<- eu_data \|\> group_by(n1, time, nc) \|\> summarise( gini_n1 = DescTools::Gini(gdp_pc_n3, weights = pop_n3, na.rm = TRUE), pop_n1 = sum(pop_n3, na.rm = TRUE), gdp_n1 = sum(gdp_n3, na.rm = TRUE), gdp_pc_n1 = gdp_n1 / pop_n1, num_reg_n1 = n_distinct(n3), .groups = "drop" )
+
+head(gini_n1_new)
+
+gini_nc_new \<- eu_data \|\> group_by(nc, time) \|\> summarise( gini_nc = DescTools::Gini(gdp_pc_n3, weights = pop_n3, na.rm = TRUE), pop_nc = sum(pop_n3, na.rm = TRUE), gdp_nc = sum(gdp_n3, na.rm = TRUE), gdp_pc_nc = gdp_nc / pop_nc, num_reg_nc = n_distinct(n3), .groups = "drop" )
+
+head(gini_nc_new)
+
+gini_all_levels \<- gini_n3 \|\> select(time, gini = gini_n3) \|\> mutate(level = "NUTS 3") \|\> bind_rows( gini_n2_new \|\> select(time, gini = gini_n2) \|\> mutate(level = "NUTS 2"), gini_n1_new \|\> select(time, gini = gini_n1) \|\> mutate(level = "NUTS 1"), gini_nc_new \|\> select(time, gini = gini_nc) \|\> mutate(level = "Country") )
+
+gini_all_levels \|\> group_by(time, level) \|\> summarise( gini = mean(gini, na.rm = TRUE), .groups = "drop" ) \|\> mutate( time = as.integer(time), level = factor(level, levels = c("Country", "NUTS 1", "NUTS 2", "NUTS 3")) ) \|\> ggplot(aes(x = time, y = gini, colour = level, group = level)) + geom_line(linewidth = 1) + labs(x = NULL, y = "Gini", colour = NULL) + theme_minimal()
+
+\`\`\`{r gini_n1_task10} gini_n1 \<- eu_data \|\> group_by(n1, time, nc) \|\> summarise( gini_n1 = DescTools::Gini(gdp_pc_n3, weights = pop_n3, na.rm = TRUE), pop_n1 = sum(pop_n3, na.rm = TRUE), gdp_n1 = sum(gdp_n3, na.rm = TRUE), gdp_pc_n1 = gdp_n1 / pop_n1, num_reg_n1 = n_distinct(n3), .groups = "drop" )
+
+head(gini_n1)
+
+\`\`\`{r gini_nc_task11} gini_nc \<- eu_data \|\> group_by(nc, time) \|\> summarise( gini_nc = DescTools::Gini(gdp_pc_n3, weights = pop_n3, na.rm = TRUE), pop_nc = sum(pop_n3, na.rm = TRUE), gdp_nc = sum(gdp_n3, na.rm = TRUE), gdp_pc_nc = gdp_nc / pop_nc, num_reg_nc = n_distinct(n3), .groups = "drop" )
+
+head(gini_nc)
+
+gini_n1 \|\> select(gini_n1, num_reg_n1, gdp_n1, pop_n1, gdp_pc_n1) \|\> summary() \|\> print(width = 76)
+
+\`\`\`{r gini_nc_summary} gini_nc \<- eu_data \|\> mutate( nc_name = dplyr::case_when( nc == "EL" \~ "Hellas", \# Greece i Eurostat nc == "UK" \~ "Storbritannia", \# hvis den finnes i dataene dine TRUE \~ countrycode::countrycode(nc, "iso2c", "country.name", warn = FALSE) ) ) \|\> group_by(nc, time, nc_name) \|\> summarise( gini_nc = DescTools::Gini(gdp_pc_n3, weights = pop_n3, na.rm = TRUE), pop_nc = sum(pop_n3, na.rm = TRUE), gdp_nc = sum(gdp_n3, na.rm = TRUE), gdp_pc_nc = gdp_nc / pop_nc, num_reg_nc = n_distinct(n3), .groups = "drop" )
+
+gini_nc \|\> select(gini_nc, num_reg_nc, gdp_nc, pop_nc, gdp_pc_nc) \|\> summary() \|\> print(width = 76)
+
+gini_all_levels \<- dplyr::bind_rows( gini_n3 \|\> dplyr::select(time, gini = gini_n3) \|\> dplyr::mutate(level = "NUTS 3"), gini_n2 \|\> dplyr::select(time, gini = gini_n2) \|\> dplyr::mutate(level = "NUTS 2"), gini_n1 \|\> dplyr::select(time, gini = gini_n1) \|\> dplyr::mutate(level = "NUTS 1"), gini_nc \|\> dplyr::select(time, gini = gini_nc) \|\> dplyr::mutate(level = "Country") )
+
+head(gini_all_levels)
+
+gini_all_levels \|\> group_by(time, level) \|\> summarise( gini = mean(gini, na.rm = TRUE), .groups = "drop" ) \|\> mutate( time = as.integer(time), level = factor(level, levels = c("Country", "NUTS 1", "NUTS 2", "NUTS 3")) ) \|\> ggplot(aes(x = time, y = gini, colour = level, group = level)) + geom_line(linewidth = 1) + labs( x = NULL, y = "Gini", colour = NULL ) + theme_minimal()
+
+gini_NUTS1_nest \<- gini_n1 \|\> group_by(nc, n1) \|\> tidyr::nest()
+
+gini_NUTS1_nest
+
+gini_NUTS2_nest \<- gini_n2_new \|\> group_by(nc, n2) \|\> tidyr::nest()
+
+gini_NUTS2_nest
+
+gini_NUTS1_trend \<- gini_NUTS1_nest \|\> mutate( data2 = purrr::map(data, \~ dplyr::filter(.x, !is.na(gini_n1), !is.na(time))), model = purrr::map( data2, \~ if (nrow(.x) \>= 2) lm(gini_n1 \~ as.integer(time), data = .x) else NA ), coef = purrr::map(model, \~ if (inherits(.x, "lm")) coef(.x) else c(NA, NA)) ) \|\> mutate( intercept = purrr::map_dbl(coef, 1), slope = purrr::map_dbl(coef, 2) ) \|\> select(nc, n1, intercept, slope)
+
+gini_NUTS1_trend
+
+# Oppgave 18: EU (gjennomsnitt) av Gini på NUTS3-nivå over tid
+
+gini_eu \<- gini_n3 \|\> group_by(time) \|\> summarise( gini_eu = mean(gini_n3, na.rm = TRUE), .groups = "drop" ) \|\> mutate(time = as.integer(time))
+
+gini_eu \|\> ggplot(aes(x = time, y = gini_eu)) + geom_line(linewidth = 1) + labs(x = "Year", y = "gini_eu") + theme_minimal()
+
+---
+title: "Untitled"
+author: "Katinca"
+date: "2025-12-15"
+output: html_document
+---
+
+library(tidyverse) library(readxl) library(restatapi) library(DescTools) library(ggrepel) library(flextable) library(modelr) library(plm) library(broom) library(sandwich)
+
+## Setup
+
+```{r setup}
+library(tidyverse)
+library(readxl)
+library(restatapi)
+library(DescTools)
+library(ggrepel)
+library(flextable)
+library(modelr)
+library(plm)
+library(broom)
+library(sandwich)
+```
+
+## 1. Population data (NUTS 3)
+
+```{r toc}
+toc_txt <- get_eurostat_toc(mode = "txt")
+```
+
+```{r pop_tables}
+pop_tabs <- toc_txt |>
+  filter(
+    str_detect(title, "[Pp]opulation") &
+      str_detect(title, "[Nn][Uu][Tt][Ss]\\s*3")
+  ) |>
+  select(title, code)
+
+pop_tabs |>
+  flextable() |>
+  width(1, 7) |>
+  width(2, 2)
+```
+
+```{r pop_code}
+pop_tab_code <- pop_tabs |>
+  filter(str_detect(title, "Average annual population")) |>
+  pull(code)
+
+pop_tab_code
+```
+
+```{r pop_dsd}
+dsd_pop <- get_eurostat_dsd(pop_tab_code)
+
+dsd_pop |>
+  filter(concept %in% c("freq", "sex", "age", "unit")) |>
+  flextable() |>
+  width(1, 1.2) |>
+  width(2, 2.2) |>
+  width(3, 6)
+```
+
+```{r population_data}
+pop <- get_eurostat_data(
+  id = pop_tab_code,
+  filters = list(
+    nuts_level = "3",
+    sex = "T",
+    age = "TOTAL"
+  ),
+  exact_match = FALSE,
+  date_filter = 2000:2023,
+  stringsAsFactors = FALSE
+) |>
+  mutate(
+    pop_n3 = 1000 * values
+  ) |>
+  select(geo, time, pop_n3) |>
+  filter(str_length(geo) == 5) |>
+  as_tibble()
+```
+
+```{r pop_check}
+dim(pop)
+head(pop)
+```
+
+## 2. GDP data (NUTS 3)
+
+```{r gdp_tables}
+gdp_tabs <- toc_txt |>
+  filter(
+    str_detect(title, "[Gg][Dd][Pp]") &
+      str_detect(title, "[Nn][Uu][Tt][Ss]\\s*3")
+  ) |>
+  select(title, code)
+
+gdp_tabs |>
+  flextable() |>
+  width(1, width = 3.5) |>
+  width(2, width = 1.5)
+```
+
+```{r gdp_dsd}
+dsd_gdp <- get_eurostat_dsd("nama_10r_3gdp")
+
+dsd_gdp |>
+  filter(concept %in% c("freq", "unit")) |>
+  flextable() |>
+  width(1, 1) |>
+  width(2, 2) |>
+  width(3, 4)
+```
+
+```{r gdp_data}
+gdp <- get_eurostat_data(
+  id = "nama_10r_3gdp",
+  filters = list(
+    nuts_level = "3",
+    unit = "MIO_PPS_EU27_2020"
+  ),
+  exact_match = FALSE,
+  date_filter = 2000:2023,
+  stringsAsFactors = FALSE
+) |>
+  mutate(gdp_n3 = 1000000 * values) |>
+  select(geo, time, gdp_n3) |>
+  filter(str_length(geo) == 5) |>
+  as_tibble()
+
+dim(gdp)
+head(gdp)
+```
+
+```{r ie053_fix}
+gdp |>
+  filter(geo == "IE053") |>
+  print(n = 25)
+
+ie_data <- tibble(
+  geo = c("IE053", "IE053", "IE053"),
+  time = c("2015", "2016", "2017"),
+  gdp_n3 = c(NA, NA, NA)
+)
+
+gdp <- bind_rows(gdp, ie_data) |>
+  arrange(geo, time) |>
+  group_by(geo) |>
+  mutate(gdp_n3 = zoo::na.approx(gdp_n3, na.rm = FALSE)) |>
+  ungroup()
+
+gdp |>
+  filter(geo == "IE053") |>
+  print(n = 25)
+```
+
+```{r join_gdp_pop}
+gdp_pop <- gdp |>
+  left_join(pop, by = c("geo", "time"))
+
+dim(gdp_pop)
+```
+
+```{r eu_data_exact}
+eu_data <- gdp_pop |>
+  filter(!str_sub(geo, 3, 4) == "ZZ") |>
+  filter(!str_sub(geo, 1, 2) %in% c("CH", "NO")) |>
+  filter(!str_sub(geo, 1, 2) %in% c("NL", "PT")) |>
+  filter(!str_sub(geo, 1, 2) %in% c("ME")) |>
+  filter(!geo == "FRY50") |>
+  filter(time > 1999 & time < 2023) |>
+  mutate(
+    n3 = geo,
+    n2 = str_sub(geo, 1, 4),
+    n1 = str_sub(geo, 1, 3),
+    nc = str_sub(geo, 1, 2),
+    gdp_pc_n3 = gdp_n3 / pop_n3
+  )
+
+dim(eu_data)
+head(eu_data)
+```
+
+```{r n3}
+n3 <- eu_data |>
+  select(time, n3, gdp_pc_n3)
+```
+
+```{r n2}
+n2 <- eu_data |>
+  group_by(time, n2) |>
+  summarise(
+    gdp_pc_n2 = weighted.mean(gdp_pc_n3, pop_n3, na.rm = TRUE),
+    .groups = "drop"
+  )
+```
+
+```{r gini_n2}
+gini_n2 <- n2 |>
+  group_by(time) |>
+  summarise(
+    gini_n2 = Gini(gdp_pc_n2),
+    .groups = "drop"
+  )
+
+head(gini_n2)
+```
+
+```{r n1}
+n1 <- eu_data |>
+  group_by(time, n1) |>
+  summarise(
+    gdp_pc_n1 = weighted.mean(gdp_pc_n3, pop_n3, na.rm = TRUE),
+    .groups = "drop"
+  )
+```
+
+```{r gini_n1}
+gini_n1 <- n1 |>
+  group_by(time) |>
+  summarise(
+    gini_n1 = Gini(gdp_pc_n1),
+    .groups = "drop"
+  )
+
+head(gini_n1)
+```
+
+```{r nc}
+nc <- eu_data |>
+  group_by(time, nc) |>
+  summarise(
+    gdp_pc_nc = weighted.mean(gdp_pc_n3, pop_n3, na.rm = TRUE),
+    .groups = "drop"
+  )
+```
+
+```{r gini_nc}
+gini_nc <- nc |>
+  group_by(time) |>
+  summarise(
+    gini_nc = Gini(gdp_pc_nc),
+    .groups = "drop"
+  )
+
+head(gini_nc)
+```
+
+```{r gini_n3}
+gini_n3 <- eu_data |>
+  group_by(time) |>
+  summarise(
+    gini_n3 = Gini(gdp_pc_n3, weights = pop_n3),
+    .groups = "drop"
+  )
+
+head(gini_n3)
+```
+
+```{r gini_all}
+gini_all <- gini_n3 |>
+  left_join(gini_n2, by = "time") |>
+  left_join(gini_n1, by = "time") |>
+  left_join(gini_nc, by = "time")
+
+gini_all |>
+  flextable() |>
+  width(1, 1.2) |>
+  width(2:5, 1.4)
+```
+
+```{r gini_all_table}
+gini_all <- gini_n3 |>
+  left_join(gini_n2, by = "time") |>
+  left_join(gini_n1, by = "time") |>
+  left_join(gini_nc, by = "time")
+
+gini_all |>
+  flextable() |>
+  width(1, 1.2) |>
+  width(2:5, 1.4)
+```
+
+```{r gini_plot}
+gini_long <- gini_all |>
+  pivot_longer(
+    cols = -time,
+    names_to = "level",
+    values_to = "gini"
+  ) |>
+  mutate(
+    time = as.integer(time),
+    level = recode(level,
+                   gini_n3 = "NUTS 3",
+                   gini_n2 = "NUTS 2",
+                   gini_n1 = "NUTS 1",
+                   gini_nc = "Country")
+  )
+
+ggplot(gini_long, aes(x = time, y = gini, color = level)) +
+  geom_line(linewidth = 1) +
+  labs(x = NULL, y = "Gini", color = NULL) +
+  theme_minimal()
+```
+
+```{r gini_plot_final, fig.width=7, fig.height=4}
+gini_long |>
+  ggplot(aes(x = time, y = gini, colour = level)) +
+  geom_line(linewidth = 1) +
+  labs(
+    x = NULL,
+    y = "Gini",
+    colour = NULL
+  ) +
+  theme_minimal()
+```
+
+\`\`\`{r gini_n2_new} gini_n2_new \<- eu_data \|\> group_by(n2, time, n1, nc) \|\> summarise( gini_n2 = DescTools::Gini(gdp_pc_n3, weights = pop_n3, na.rm = TRUE), pop_n2 = sum(pop_n3, na.rm = TRUE), gdp_n2 = sum(gdp_n3, na.rm = TRUE), gdp_pc_n2 = gdp_n2 / pop_n2, num_reg_n2 = n(), .groups = "drop" )
+
+head(gini_n2_new)
+
+\`\`\`{r gini_n1_new} gini_n1_new \<- eu_data \|\> group_by(n1, time, nc) \|\> summarise( gini_n1 = DescTools::Gini(gdp_pc_n3, weights = pop_n3, na.rm = TRUE), pop_n1 = sum(pop_n3, na.rm = TRUE), gdp_n1 = sum(gdp_n3, na.rm = TRUE), gdp_pc_n1 = gdp_n1 / pop_n1, num_reg_n1 = n_distinct(n3), .groups = "drop" )
+
+head(gini_n1_new)
+
+gini_nc_new \<- eu_data \|\> group_by(nc, time) \|\> summarise( gini_nc = DescTools::Gini(gdp_pc_n3, weights = pop_n3, na.rm = TRUE), pop_nc = sum(pop_n3, na.rm = TRUE), gdp_nc = sum(gdp_n3, na.rm = TRUE), gdp_pc_nc = gdp_nc / pop_nc, num_reg_nc = n_distinct(n3), .groups = "drop" )
+
+head(gini_nc_new)
+
+gini_all_levels \<- gini_n3 \|\> select(time, gini = gini_n3) \|\> mutate(level = "NUTS 3") \|\> bind_rows( gini_n2_new \|\> select(time, gini = gini_n2) \|\> mutate(level = "NUTS 2"), gini_n1_new \|\> select(time, gini = gini_n1) \|\> mutate(level = "NUTS 1"), gini_nc_new \|\> select(time, gini = gini_nc) \|\> mutate(level = "Country") )
+
+gini_all_levels \|\> group_by(time, level) \|\> summarise( gini = mean(gini, na.rm = TRUE), .groups = "drop" ) \|\> mutate( time = as.integer(time), level = factor(level, levels = c("Country", "NUTS 1", "NUTS 2", "NUTS 3")) ) \|\> ggplot(aes(x = time, y = gini, colour = level, group = level)) + geom_line(linewidth = 1) + labs(x = NULL, y = "Gini", colour = NULL) + theme_minimal()
+
+\`\`\`{r gini_n1_task10} gini_n1 \<- eu_data \|\> group_by(n1, time, nc) \|\> summarise( gini_n1 = DescTools::Gini(gdp_pc_n3, weights = pop_n3, na.rm = TRUE), pop_n1 = sum(pop_n3, na.rm = TRUE), gdp_n1 = sum(gdp_n3, na.rm = TRUE), gdp_pc_n1 = gdp_n1 / pop_n1, num_reg_n1 = n_distinct(n3), .groups = "drop" )
+
+head(gini_n1)
+
+\`\`\`{r gini_nc_task11} gini_nc \<- eu_data \|\> group_by(nc, time) \|\> summarise( gini_nc = DescTools::Gini(gdp_pc_n3, weights = pop_n3, na.rm = TRUE), pop_nc = sum(pop_n3, na.rm = TRUE), gdp_nc = sum(gdp_n3, na.rm = TRUE), gdp_pc_nc = gdp_nc / pop_nc, num_reg_nc = n_distinct(n3), .groups = "drop" )
+
+head(gini_nc)
+
+gini_n1 \|\> select(gini_n1, num_reg_n1, gdp_n1, pop_n1, gdp_pc_n1) \|\> summary() \|\> print(width = 76)
+
+\`\`\`{r gini_nc_summary} gini_nc \<- eu_data \|\> mutate( nc_name = dplyr::case_when( nc == "EL" \~ "Hellas", \# Greece i Eurostat nc == "UK" \~ "Storbritannia", \# hvis den finnes i dataene dine TRUE \~ countrycode::countrycode(nc, "iso2c", "country.name", warn = FALSE) ) ) \|\> group_by(nc, time, nc_name) \|\> summarise( gini_nc = DescTools::Gini(gdp_pc_n3, weights = pop_n3, na.rm = TRUE), pop_nc = sum(pop_n3, na.rm = TRUE), gdp_nc = sum(gdp_n3, na.rm = TRUE), gdp_pc_nc = gdp_nc / pop_nc, num_reg_nc = n_distinct(n3), .groups = "drop" )
+
+gini_nc \|\> select(gini_nc, num_reg_nc, gdp_nc, pop_nc, gdp_pc_nc) \|\> summary() \|\> print(width = 76)
+
+gini_all_levels \<- dplyr::bind_rows( gini_n3 \|\> dplyr::select(time, gini = gini_n3) \|\> dplyr::mutate(level = "NUTS 3"), gini_n2 \|\> dplyr::select(time, gini = gini_n2) \|\> dplyr::mutate(level = "NUTS 2"), gini_n1 \|\> dplyr::select(time, gini = gini_n1) \|\> dplyr::mutate(level = "NUTS 1"), gini_nc \|\> dplyr::select(time, gini = gini_nc) \|\> dplyr::mutate(level = "Country") )
+
+head(gini_all_levels)
+
+gini_all_levels \|\> group_by(time, level) \|\> summarise( gini = mean(gini, na.rm = TRUE), .groups = "drop" ) \|\> mutate( time = as.integer(time), level = factor(level, levels = c("Country", "NUTS 1", "NUTS 2", "NUTS 3")) ) \|\> ggplot(aes(x = time, y = gini, colour = level, group = level)) + geom_line(linewidth = 1) + labs( x = NULL, y = "Gini", colour = NULL ) + theme_minimal()
+
+gini_NUTS1_nest \<- gini_n1 \|\> group_by(nc, n1) \|\> tidyr::nest()
+
+gini_NUTS1_nest
+
+gini_NUTS2_nest \<- gini_n2_new \|\> group_by(nc, n2) \|\> tidyr::nest()
+
+gini_NUTS2_nest
+
+gini_NUTS1_trend \<- gini_NUTS1_nest \|\> mutate( data2 = purrr::map(data, \~ dplyr::filter(.x, !is.na(gini_n1), !is.na(time))), model = purrr::map( data2, \~ if (nrow(.x) \>= 2) lm(gini_n1 \~ as.integer(time), data = .x) else NA ), coef = purrr::map(model, \~ if (inherits(.x, "lm")) coef(.x) else c(NA, NA)) ) \|\> mutate( intercept = purrr::map_dbl(coef, 1), slope = purrr::map_dbl(coef, 2) ) \|\> select(nc, n1, intercept, slope)
+
+gini_NUTS1_trend
+
+# Oppgave 18: EU (gjennomsnitt) av Gini på NUTS3-nivå over tid
+
+gini_eu \<- gini_n3 \|\> group_by(time) \|\> summarise( gini_eu = mean(gini_n3, na.rm = TRUE), .groups = "drop" ) \|\> mutate(time = as.integer(time))
+
+gini_eu \|\> ggplot(aes(x = time, y = gini_eu)) + geom_line(linewidth = 1) + labs(x = "Year", y = "gini_eu") + theme_minimal()
