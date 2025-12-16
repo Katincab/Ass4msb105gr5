@@ -2,9 +2,31 @@
 title: "assignment4msb105"
 format: html
 editor: visual
+author: "Katinca Valvatne, Frida Alendal"
 ---
 
-Hei hei
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
